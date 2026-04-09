@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 TITLE = "Duplicación Android"
 _SINGLETON_PORT = 49819
@@ -87,12 +87,30 @@ def nested_mirror_launcher_path() -> Optional[Path]:
 
 
 def nested_mirror_app_bundle_path() -> Optional[Path]:
-    """Ruta al .app hijo (LSUIElement); preferir lanzar con /usr/bin/open -a para respetar el bundle."""
+    """Ruta al .app hijo (LSUIElement); «open -a» respeta LSUIElement pero el proceso open miente con el exit code."""
     contents = main_bundle_contents_dir()
     if contents is None:
         return None
     p = contents / "Frameworks" / "DuplicacionAndroidEspejo.app"
     if p.is_dir():
+        return p.resolve()
+    return None
+
+
+def nested_mirror_scrcpy_binary_path() -> Optional[Path]:
+    """Mach-O scrcpy dentro del .app espejo (mismo binario que lanza el script DuplicacionEspejo)."""
+    contents = main_bundle_contents_dir()
+    if contents is None:
+        return None
+    p = (
+        contents
+        / "Frameworks"
+        / "DuplicacionAndroidEspejo.app"
+        / "Contents"
+        / "MacOS"
+        / "DuplicacionAndroidMirror"
+    )
+    if p.is_file():
         return p.resolve()
     return None
 
@@ -105,7 +123,59 @@ def resolve_adb() -> Optional[str]:
     return shutil.which("adb")
 
 
+def _serial_parece_adb_por_red(serial: str) -> bool:
+    """True si el serial tiene forma IPv4:puerto (dispositivo ya visto por ADB en red)."""
+    if ":" not in serial:
+        return False
+    host, _, port_s = serial.rpartition(":")
+    try:
+        ipaddress.IPv4Address(host)
+        int(port_s)
+        return True
+    except ValueError:
+        return False
+
+
+def clasificar_dispositivos_adb(adb_bin: str) -> tuple[List[str], List[str], Optional[str]]:
+    """Una sola llamada a «adb devices»: seriales USB/cable vs IP:puerto (estado «device»)."""
+    r = subprocess.run(
+        [adb_bin, "devices"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if r.returncode != 0:
+        return [], [], (r.stderr or r.stdout or "adb devices falló").strip() or "adb devices falló"
+    usbs: List[str] = []
+    reds: List[str] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        if state != "device":
+            continue
+        if _serial_parece_adb_por_red(serial):
+            reds.append(serial)
+        else:
+            usbs.append(serial)
+    return usbs, reds, None
+
+
+def _orden_serial_red(serial: str) -> Tuple[int, ...]:
+    if not _serial_parece_adb_por_red(serial):
+        return (999,)
+    host, _, ps = serial.rpartition(":")
+    return tuple(int(x) for x in host.split(".")) + (int(ps),)
+
+
 def resolve_scrcpy() -> Optional[str]:
+    nested_bin = nested_mirror_scrcpy_binary_path()
+    if nested_bin is not None:
+        return str(nested_bin)
     nested = nested_mirror_launcher_path()
     if nested is not None:
         return str(nested)
@@ -122,6 +192,8 @@ def resolve_scrcpy() -> Optional[str]:
 
 
 def _hay_binario_scrcpy_embebido() -> bool:
+    if nested_mirror_scrcpy_binary_path() is not None:
+        return True
     if nested_mirror_app_bundle_path() is not None:
         return True
     if nested_mirror_launcher_path() is not None:
@@ -234,17 +306,13 @@ def _leer_y_borrar_log_scrcpy(path: str) -> str:
 
 def popen_scrcpy(serial: str) -> tuple[subprocess.Popen, str]:
     """Devuelve (proceso, ruta de log stderr temporal para diagnóstico)."""
-    nested_app = nested_mirror_app_bundle_path()
-    if _frozen() and sys.platform == "darwin" and nested_app is not None:
-        # open -a aplica Info.plist del bundle (LSUIElement); ejecutar el Mach-O directo suele
-        # hacer que SDL/scrcpy aparezca como otra app en el Dock.
+    # Importante: NO usar solo «open -W -a …»: el PID es «open», que a menudo termina con
+    # código 0 al instante aunque scrcpy siga vivo → falso «scrcpy terminó antes de estabilizarse».
+    # Ejecutar el Mach-O del bundle espejo + scrcpy_subprocess_env() (ADB y server embebidos).
+    nested_scrcpy = nested_mirror_scrcpy_binary_path()
+    if _frozen() and sys.platform == "darwin" and nested_scrcpy is not None:
         cmd = [
-            "/usr/bin/open",
-            "-n",
-            "-W",
-            "-a",
-            str(nested_app),
-            "--args",
+            str(nested_scrcpy),
             "-S",
             "-s",
             serial,
@@ -271,7 +339,7 @@ def popen_scrcpy(serial: str) -> tuple[subprocess.Popen, str]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=err_f,
-            start_new_session=not (_frozen() and sys.platform == "darwin"),
+            start_new_session=True,
         )
     finally:
         err_f.close()
@@ -344,8 +412,8 @@ def run_gui(
 
     root = tk.Tk()
     root.title(TITLE)
-    root.geometry("460x360")
-    root.minsize(400, 300)
+    root.geometry("520x420")
+    root.minsize(420, 340)
 
     icon_png = app_resources_dir() / "DuplicacionAndroidIcon.png"
     if icon_png.is_file():
@@ -356,31 +424,45 @@ def run_gui(
         except tk.TclError:
             pass
 
+    main = ttk.Frame(root, padding=8)
+    main.pack(fill=tk.BOTH, expand=True)
+
     cidr_var = tk.StringVar(value=cidr or "")
-    status = tk.StringVar(value="Pulsa «Buscar dispositivos».")
-    list_frame = ttk.Frame(root, padding=8)
-    list_frame.pack(fill=tk.BOTH, expand=True)
-    ttk.Label(list_frame, text="Red (opcional, vacío = /24 de tu IP):").pack(anchor=tk.W)
-    entry_cidr = ttk.Entry(list_frame, textvariable=cidr_var)
-    entry_cidr.pack(fill=tk.X, pady=(0, 6))
-    ttk.Label(list_frame, textvariable=status).pack(anchor=tk.W)
-    lb_frame = ttk.Frame(list_frame)
+    status = tk.StringVar(
+        value="Pulsa «Buscar dispositivos» para ver USB, red y dispositivos ya conectados por ADB."
+    )
+    ttk.Label(main, text="Red (opcional, vacío = /24 de tu IP):").pack(anchor=tk.W)
+    entry_cidr = ttk.Entry(main, textvariable=cidr_var)
+    entry_cidr.pack(fill=tk.X, pady=(0, 4))
+    ttk.Label(
+        main,
+        text=(
+            "Lista unificada: [USB] cable; [Wi‑Fi] red (escaneo o ya visto por adb). "
+            "Elige uno y «Conectar y duplicar». «Activar 5555 por USB» solo con cable."
+        ),
+        wraplength=500,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 4))
+    ttk.Label(main, textvariable=status).pack(anchor=tk.W)
+    lb_frame = ttk.Frame(main)
     lb_frame.pack(fill=tk.BOTH, expand=True, pady=6)
     sb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL)
-    listbox = tk.Listbox(lb_frame, height=10, exportselection=False, yscrollcommand=sb.set)
+    listbox = tk.Listbox(lb_frame, height=11, exportselection=False, yscrollcommand=sb.set)
     sb.config(command=listbox.yview)
     listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     sb.pack(side=tk.RIGHT, fill=tk.Y)
-    btn_row = ttk.Frame(list_frame)
+    btn_row = ttk.Frame(main)
     btn_row.pack(fill=tk.X)
 
-    candidatos_actuales: List[str] = []
+    # (texto en lista, serial adb, requiere «adb connect» antes de scrcpy)
+    filas_actuales: List[Tuple[str, str, bool]] = []
     proceso_espejo: List[Optional[subprocess.Popen]] = [None]
 
     def ui_conexion_bloqueada(bloquear: bool) -> None:
         st = tk.DISABLED if bloquear else tk.NORMAL
         btn_scan.state(["disabled"] if bloquear else ["!disabled"])
         btn_connect.state(["disabled"] if bloquear else ["!disabled"])
+        btn_tcpip_usb.state(["disabled"] if bloquear else ["!disabled"])
         try:
             listbox.config(state=st)
         except tk.TclError:
@@ -393,38 +475,139 @@ def run_gui(
 
     def do_scan() -> None:
         raw = cidr_var.get().strip()
-        set_status("Escaneando…")
+        set_status("Buscando puerto 5555 en la red y leyendo dispositivos USB/ADB…")
         listbox.delete(0, tk.END)
         root.update_idletasks()
+        adb_bin = resolve_adb()
+        assert adb_bin
 
         def work() -> None:
-            ips, err = _resolver_ips(raw or None, prefijo)
-            if err:
-                root.after(0, lambda: on_scan_done([], err))
+            ips, err_red = _resolver_ips(raw or None, prefijo)
+            usbs, reds_en_adb, err_adb = clasificar_dispositivos_adb(adb_bin)
+            if err_red:
+                root.after(0, lambda: on_scan_merge([], [], set(), err_red, None))
                 return
             assert ips is not None
-            found = escanear_puerto_5555(ips, workers, timeout_s)
-            root.after(0, lambda: on_scan_done(found, None))
+            encontrados_tcp = escanear_puerto_5555(ips, workers, timeout_s)
+            tcp_serials = {f"{ip}:5555" for ip in encontrados_tcp}
+            wifi_serials = set(tcp_serials) | set(reds_en_adb)
+            root.after(
+                0,
+                lambda: on_scan_merge(
+                    sorted(usbs),
+                    sorted(wifi_serials, key=_orden_serial_red),
+                    tcp_serials,
+                    None,
+                    err_adb,
+                ),
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_scan_done(found: List[str], err: Optional[str]) -> None:
-        nonlocal candidatos_actuales
-        candidatos_actuales = found
+    def on_scan_merge(
+        usbs: List[str],
+        wifi_ordenados: List[str],
+        tcp_serials: set[str],
+        err_red: Optional[str],
+        err_adb: Optional[str],
+    ) -> None:
+        nonlocal filas_actuales
+        filas_actuales = []
         listbox.delete(0, tk.END)
-        if err:
-            set_status(err)
-            messagebox.showerror(TITLE, err)
+        if err_red:
+            set_status(err_red)
+            messagebox.showerror(TITLE, err_red)
             return
-        for ip in found:
-            listbox.insert(tk.END, f"{ip}:5555")
-        if found:
+        for s in usbs:
+            filas_actuales.append((f"{s}  [USB · cable]", s, False))
+        for ser in wifi_ordenados:
+            if ser in tcp_serials:
+                suf = "[Wi‑Fi · escaneo de red]"
+            else:
+                suf = "[Wi‑Fi · ya en adb, sin escaneo]"
+            filas_actuales.append((f"{ser}  {suf}", ser, True))
+        for label, _, _ in filas_actuales:
+            listbox.insert(tk.END, label)
+        if filas_actuales:
             listbox.selection_set(0)
-            set_status(f"{len(found)} dispositivo(s) con puerto 5555.")
-        else:
-            set_status(
-                "Ningún host con 5555 abierto. Activa ADB por red en el móvil (p. ej. adb tcpip 5555)."
+        n_usb = len(usbs)
+        n_wifi = len(wifi_ordenados)
+        set_status(
+            f"{n_usb} por USB, {n_wifi} por Wi‑Fi en lista. "
+            "Si el móvil no sale: misma Wi‑Fi, sin aislamiento AP, o prueba «Activar 5555 por USB»."
+        )
+        if err_adb:
+            messagebox.showwarning(
+                TITLE,
+                f"No se pudo leer «adb devices» bien:\n{err_adb}\n"
+                "La lista puede faltar entradas USB o «ya en adb».",
             )
+        elif not filas_actuales:
+            messagebox.showinfo(
+                TITLE,
+                "No hay dispositivos.\n"
+                "· USB: cable, depuración USB y autorizar este equipo.\n"
+                "· Wi‑Fi: en el móvil depuración inalámbrica o «adb tcpip 5555» con cable; "
+                "PC y teléfono en la misma red.",
+            )
+
+    def aplicar_tcpip_usb() -> None:
+        adb_bin = resolve_adb()
+        if not adb_bin:
+            return
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showwarning(
+                TITLE,
+                "Selecciona en la lista una línea [USB · cable] y pulsa de nuevo.",
+            )
+            return
+        idx = sel[0]
+        if idx >= len(filas_actuales):
+            return
+        _, serial, requiere_connect = filas_actuales[idx]
+        if requiere_connect:
+            messagebox.showwarning(
+                TITLE,
+                "«Activar 5555 por USB» solo aplica con el teléfono conectado por cable. "
+                "Elige una línea que diga [USB · cable].",
+            )
+            return
+        set_status("Ejecutando adb tcpip 5555…")
+        root.update_idletasks()
+
+        def work() -> None:
+            r = subprocess.run(
+                [adb_bin, "-s", serial, "tcpip", "5555"],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            out = (r.stdout or "").strip()
+            err_txt = (r.stderr or "").strip()
+            texto = "\n".join(x for x in (out, err_txt) if x)
+
+            def done() -> None:
+                if r.returncode != 0:
+                    set_status("adb tcpip falló.")
+                    messagebox.showerror(
+                        TITLE,
+                        texto or "adb tcpip 5555 devolvió error.",
+                    )
+                    return
+                set_status(
+                    "Puerto 5555 listo por Wi‑Fi. Pulsa «Buscar dispositivos» o desenchufa el USB."
+                )
+                msg = "Listo. Salida de adb:\n" + (texto or "(sin mensaje)")
+                msg += (
+                    "\n\nVuelve a pulsar «Buscar dispositivos» para ver la IP en la lista. "
+                    "PC y móvil deben estar en la misma Wi‑Fi."
+                )
+                messagebox.showinfo(TITLE, msg)
+
+            root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _root_viva() -> bool:
         try:
@@ -444,26 +627,31 @@ def run_gui(
                 "Ya hay un espejo en curso. Cierra esa ventana primero o espera a que termine.",
             )
             return
-        line = listbox.get(sel[0])
-        serial = line.strip()
-        if ":5555" not in serial:
-            serial = f"{serial}:5555"
+        idx = sel[0]
+        if idx >= len(filas_actuales):
+            messagebox.showwarning(TITLE, "Vuelve a pulsar «Buscar dispositivos».")
+            return
+        _, serial, requiere_adb_connect = filas_actuales[idx]
         ui_conexion_bloqueada(True)
-        set_status("Conectando (ADB)…")
-        root.update_idletasks()
         adb_bin = resolve_adb()
         assert adb_bin
-        r = subprocess.run(
-            [adb_bin, "connect", serial],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if r.returncode != 0:
-            ui_conexion_bloqueada(False)
-            messagebox.showerror(TITLE, f"adb connect falló:\n{r.stderr or r.stdout}")
-            set_status("Error en adb connect.")
-            return
+        if requiere_adb_connect:
+            set_status("Conectando por Wi‑Fi (adb connect)…")
+            root.update_idletasks()
+            r = subprocess.run(
+                [adb_bin, "connect", serial],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                ui_conexion_bloqueada(False)
+                messagebox.showerror(TITLE, f"adb connect falló:\n{r.stderr or r.stdout}")
+                set_status("Error en adb connect.")
+                return
+        else:
+            set_status("Conectando por USB (sin adb connect)…")
+            root.update_idletasks()
         set_status("Iniciando espejo…")
         root.update_idletasks()
         try:
@@ -546,10 +734,10 @@ def run_gui(
                 detalle = _leer_y_borrar_log_scrcpy(err_path)
                 msg = (
                     "scrcpy terminó antes de estabilizarse (código "
-                    f"{code}). El equipo sí está en la red; el fallo suele ser "
-                    "ADB interno, autorización del teléfono o librerías de "
-                    "scrcpy (Homebrew).\n\n"
-                    "Ya se fuerza el adb embebido del .app (variable ADB)."
+                    f"{code}). Suele ser autorización en el teléfono, adb o "
+                    "librerías de scrcpy (Homebrew en /opt/homebrew/lib).\n\n"
+                    "El .app ya usa adb y scrcpy-server embebidos en Resources/bundled "
+                    "(variable ADB en el proceso de scrcpy)."
                 )
                 if detalle:
                     msg += "\n\nSalida de scrcpy:\n" + detalle
@@ -564,6 +752,12 @@ def run_gui(
     btn_scan.pack(side=tk.LEFT, padx=(0, 6))
     btn_connect = ttk.Button(btn_row, text="Conectar y duplicar", command=do_connect)
     btn_connect.pack(side=tk.LEFT, padx=(0, 6))
+    btn_tcpip_usb = ttk.Button(
+        btn_row,
+        text="Activar 5555 por USB",
+        command=aplicar_tcpip_usb,
+    )
+    btn_tcpip_usb.pack(side=tk.LEFT, padx=(0, 6))
 
     def on_salir() -> None:
         p = proceso_espejo[0]

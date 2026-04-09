@@ -17,7 +17,8 @@ if [[ ! -f "$SRC" ]]; then
 fi
 
 echo "→ Creando venv e instalando PyInstaller…"
-python3 -m venv "$VENV"
+# --clear evita un .venv “roto” si el proyecto se movió de carpeta (shebang apuntando a otra ruta).
+python3 -m venv --clear "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q pyinstaller pillow
 
