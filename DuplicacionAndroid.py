@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Duplicación Android: busca hosts con ADB TCP (5555), conecta y lanza scrcpy (-S apaga la pantalla).
+Duplicación Android: busca hosts con ADB TCP (5555), conecta y lanza scrcpy (opcional -S apaga la pantalla).
 
 .app (macOS): al conectar, la ventana de la lista se oculta por completo (withdraw); la app sigue
 en el Dock como «Duplicación Android». El espejo se arranca con «open -a» al .app anidado LSUIElement
@@ -134,6 +134,74 @@ def _serial_parece_adb_por_red(serial: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _adb_serial_en_estado_device(adb_bin: str, serial: str) -> bool:
+    r = subprocess.run(
+        [adb_bin, "devices"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
+            return True
+    return False
+
+
+def obtener_nombre_dispositivo_adb(
+    adb_bin: str, serial: str, intentar_connect: bool
+) -> Optional[str]:
+    """Fabricante + modelo (getprop). Si hace falta, adb connect para seriales IP:puerto."""
+    try:
+        if not _adb_serial_en_estado_device(adb_bin, serial):
+            if not intentar_connect:
+                return None
+            cr = subprocess.run(
+                [adb_bin, "connect", serial],
+                capture_output=True,
+                text=True,
+                timeout=14,
+            )
+            if cr.returncode != 0:
+                return None
+        if not _adb_serial_en_estado_device(adb_bin, serial):
+            return None
+        man = subprocess.run(
+            [adb_bin, "-s", serial, "shell", "getprop", "ro.product.manufacturer"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        mod = subprocess.run(
+            [adb_bin, "-s", serial, "shell", "getprop", "ro.product.model"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        m = (man.stdout or "").strip()
+        mo = (mod.stdout or "").strip()
+        nombre = f"{m} {mo}".strip()
+        return nombre if nombre else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def etiqueta_fila_dispositivo(
+    serial: str,
+    nombre: Optional[str],
+    kind: str,
+) -> str:
+    """kind: usb | tcp | adb (solo afecta al sufijo [USB]/[Wi‑Fi])."""
+    suf_nombre = f" — {nombre}" if nombre else ""
+    if kind == "usb":
+        return f"{serial}{suf_nombre}  [USB · cable]"
+    if kind == "tcp":
+        return f"{serial}{suf_nombre}  [Wi‑Fi · escaneo de red]"
+    return f"{serial}{suf_nombre}  [Wi‑Fi · ya en adb, sin escaneo]"
 
 
 def clasificar_dispositivos_adb(adb_bin: str) -> tuple[List[str], List[str], Optional[str]]:
@@ -291,6 +359,32 @@ def _scrcpy_env() -> dict:
     return env
 
 
+def construir_argumentos_scrcpy(
+    serial: str,
+    apagar_pantalla_fisica: bool,
+    compat_miu: bool,
+) -> List[str]:
+    """
+    Flags para evitar ventana negra y falta de toque en Xiaomi/Redmi/MIUI:
+    - -w mantiene el dispositivo despierto.
+    - --render-driver=metal en macOS suele arreglar SDL en negro.
+    - --mouse=uhid --keyboard=uhid evita el modo SDK que MIUI suele bloquear
+      (además activa «Depuración USB (ajustes de seguridad)» en el móvil).
+    Con compat_miu activo no se usa -S aunque el usuario lo pida: en muchos
+    Xiaomi -S deja el vídeo en negro y sin control.
+    """
+    args: List[str] = []
+    if apagar_pantalla_fisica and not compat_miu:
+        args.append("-S")
+    args.append("-w")
+    if sys.platform == "darwin":
+        args.extend(["--render-driver=metal"])
+    if compat_miu:
+        args.extend(["--mouse=uhid", "--keyboard=uhid"])
+    args.extend(["-s", serial, f"--window-title={TITLE}"])
+    return args
+
+
 def _leer_y_borrar_log_scrcpy(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -304,31 +398,26 @@ def _leer_y_borrar_log_scrcpy(path: str) -> str:
     return text
 
 
-def popen_scrcpy(serial: str) -> tuple[subprocess.Popen, str]:
+def popen_scrcpy(
+    serial: str,
+    apagar_pantalla_fisica: bool = False,
+    compat_miu: bool = False,
+) -> tuple[subprocess.Popen, str]:
     """Devuelve (proceso, ruta de log stderr temporal para diagnóstico)."""
     # Importante: NO usar solo «open -W -a …»: el PID es «open», que a menudo termina con
     # código 0 al instante aunque scrcpy siga vivo → falso «scrcpy terminó antes de estabilizarse».
     # Ejecutar el Mach-O del bundle espejo + scrcpy_subprocess_env() (ADB y server embebidos).
     nested_scrcpy = nested_mirror_scrcpy_binary_path()
     if _frozen() and sys.platform == "darwin" and nested_scrcpy is not None:
-        cmd = [
-            str(nested_scrcpy),
-            "-S",
-            "-s",
-            serial,
-            f"--window-title={TITLE}",
-        ]
+        exe = str(nested_scrcpy)
     else:
         bin_scrcpy = resolve_scrcpy()
         if not bin_scrcpy:
             raise FileNotFoundError("scrcpy")
-        cmd = [
-            bin_scrcpy,
-            "-S",
-            "-s",
-            serial,
-            f"--window-title={TITLE}",
-        ]
+        exe = bin_scrcpy
+    cmd = [exe] + construir_argumentos_scrcpy(
+        serial, apagar_pantalla_fisica, compat_miu
+    )
     fd, err_path = tempfile.mkstemp(prefix="dupandr-scrcpy-", suffix=".log", text=False)
     os.close(fd)
     err_f = open(err_path, "wb")
@@ -412,8 +501,8 @@ def run_gui(
 
     root = tk.Tk()
     root.title(TITLE)
-    root.geometry("520x420")
-    root.minsize(420, 340)
+    root.geometry("560x440")
+    root.minsize(460, 360)
 
     icon_png = app_resources_dir() / "DuplicacionAndroidIcon.png"
     if icon_png.is_file():
@@ -440,9 +529,43 @@ def run_gui(
             "Lista unificada: [USB] cable; [Wi‑Fi] red (escaneo o ya visto por adb). "
             "Elige uno y «Conectar y duplicar». «Activar 5555 por USB» solo con cable."
         ),
-        wraplength=500,
+        wraplength=520,
         justify=tk.LEFT,
     ).pack(anchor=tk.W, pady=(0, 4))
+    apagar_pantalla_var = tk.BooleanVar(value=False)
+    ttk.Label(
+        main,
+        text=(
+            "Opción -S: apaga la pantalla física del móvil al duplicar. En Xiaomi/Redmi suele "
+            "impedir clics y gestos desde el Mac; déjala desmarcada si no controlas la pantalla."
+        ),
+        wraplength=520,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 2))
+    chk_apagar = ttk.Checkbutton(
+        main,
+        text="Apagar pantalla del teléfono al duplicar (-S)",
+        variable=apagar_pantalla_var,
+    )
+    chk_apagar.pack(anchor=tk.W, pady=(0, 2))
+    compat_miu_var = tk.BooleanVar(value=True)
+    ttk.Label(
+        main,
+        text=(
+            "Xiaomi / Redmi / MIUI: ratón y teclado por UHID, render Metal en Mac y se ignora -S "
+            "mientras esto esté activo (evita pantalla negra y sin toque). "
+            "En el móvil activa también «Depuración USB (ajustes de seguridad)». "
+            "Desmarca solo si otro dispositivo falla con UHID."
+        ),
+        wraplength=520,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 2))
+    chk_compat_miu = ttk.Checkbutton(
+        main,
+        text="Compatibilidad Xiaomi / MIUI (recomendado para Redmi)",
+        variable=compat_miu_var,
+    )
+    chk_compat_miu.pack(anchor=tk.W, pady=(0, 4))
     ttk.Label(main, textvariable=status).pack(anchor=tk.W)
     lb_frame = ttk.Frame(main)
     lb_frame.pack(fill=tk.BOTH, expand=True, pady=6)
@@ -454,8 +577,8 @@ def run_gui(
     btn_row = ttk.Frame(main)
     btn_row.pack(fill=tk.X)
 
-    # (texto en lista, serial adb, requiere «adb connect» antes de scrcpy)
-    filas_actuales: List[Tuple[str, str, bool]] = []
+    # texto, serial adb, requiere adb connect, kind: usb|tcp|adb
+    filas_actuales: List[Tuple[str, str, bool, str]] = []
     proceso_espejo: List[Optional[subprocess.Popen]] = [None]
 
     def ui_conexion_bloqueada(bloquear: bool) -> None:
@@ -463,6 +586,8 @@ def run_gui(
         btn_scan.state(["disabled"] if bloquear else ["!disabled"])
         btn_connect.state(["disabled"] if bloquear else ["!disabled"])
         btn_tcpip_usb.state(["disabled"] if bloquear else ["!disabled"])
+        chk_apagar.state(["disabled"] if bloquear else ["!disabled"])
+        chk_compat_miu.state(["disabled"] if bloquear else ["!disabled"])
         try:
             listbox.config(state=st)
         except tk.TclError:
@@ -519,14 +644,15 @@ def run_gui(
             messagebox.showerror(TITLE, err_red)
             return
         for s in usbs:
-            filas_actuales.append((f"{s}  [USB · cable]", s, False))
+            filas_actuales.append(
+                (etiqueta_fila_dispositivo(s, None, "usb"), s, False, "usb")
+            )
         for ser in wifi_ordenados:
-            if ser in tcp_serials:
-                suf = "[Wi‑Fi · escaneo de red]"
-            else:
-                suf = "[Wi‑Fi · ya en adb, sin escaneo]"
-            filas_actuales.append((f"{ser}  {suf}", ser, True))
-        for label, _, _ in filas_actuales:
+            wkind = "tcp" if ser in tcp_serials else "adb"
+            filas_actuales.append(
+                (etiqueta_fila_dispositivo(ser, None, wkind), ser, True, wkind)
+            )
+        for label, _, _, _ in filas_actuales:
             listbox.insert(tk.END, label)
         if filas_actuales:
             listbox.selection_set(0)
@@ -534,8 +660,39 @@ def run_gui(
         n_wifi = len(wifi_ordenados)
         set_status(
             f"{n_usb} por USB, {n_wifi} por Wi‑Fi en lista. "
-            "Si el móvil no sale: misma Wi‑Fi, sin aislamiento AP, o prueba «Activar 5555 por USB»."
+            "Obteniendo nombres (fabricante/modelo)…"
         )
+
+        def enrich_worker() -> None:
+            adb_b = resolve_adb()
+            if not adb_b or not filas_actuales:
+                return
+            snapshot = list(filas_actuales)
+            updates: List[Tuple[int, str, bool, str, Optional[str]]] = []
+            for i, (_, ser, req, kind) in enumerate(snapshot):
+                nom = obtener_nombre_dispositivo_adb(
+                    adb_b, ser, intentar_connect=(kind != "usb")
+                )
+                updates.append((i, ser, req, kind, nom))
+
+            def apply_ui() -> None:
+                if len(filas_actuales) != len(snapshot):
+                    return
+                for i, ser, req, kind, nom in updates:
+                    if i >= len(filas_actuales) or filas_actuales[i][1] != ser:
+                        continue
+                    lab = etiqueta_fila_dispositivo(ser, nom, kind)
+                    filas_actuales[i] = (lab, ser, req, kind)
+                    listbox.delete(i)
+                    listbox.insert(i, lab)
+                set_status(
+                    f"{n_usb} por USB, {n_wifi} por Wi‑Fi en lista. "
+                    "Si el móvil no sale: misma Wi‑Fi, sin aislamiento AP, o prueba «Activar 5555 por USB»."
+                )
+
+            root.after(0, apply_ui)
+
+        threading.Thread(target=enrich_worker, daemon=True).start()
         if err_adb:
             messagebox.showwarning(
                 TITLE,
@@ -565,7 +722,7 @@ def run_gui(
         idx = sel[0]
         if idx >= len(filas_actuales):
             return
-        _, serial, requiere_connect = filas_actuales[idx]
+        _, serial, requiere_connect, _ = filas_actuales[idx]
         if requiere_connect:
             messagebox.showwarning(
                 TITLE,
@@ -631,7 +788,7 @@ def run_gui(
         if idx >= len(filas_actuales):
             messagebox.showwarning(TITLE, "Vuelve a pulsar «Buscar dispositivos».")
             return
-        _, serial, requiere_adb_connect = filas_actuales[idx]
+        _, serial, requiere_adb_connect, _ = filas_actuales[idx]
         ui_conexion_bloqueada(True)
         adb_bin = resolve_adb()
         assert adb_bin
@@ -652,10 +809,19 @@ def run_gui(
         else:
             set_status("Conectando por USB (sin adb connect)…")
             root.update_idletasks()
-        set_status("Iniciando espejo…")
+        if apagar_pantalla_var.get() and compat_miu_var.get():
+            set_status(
+                "Compat. MIUI activa: no se usará -S (evita negro/sin toque en Xiaomi). Iniciando espejo…"
+            )
+        else:
+            set_status("Iniciando espejo…")
         root.update_idletasks()
         try:
-            proc, err_log_path = popen_scrcpy(serial)
+            proc, err_log_path = popen_scrcpy(
+                serial,
+                apagar_pantalla_fisica=apagar_pantalla_var.get(),
+                compat_miu=compat_miu_var.get(),
+            )
         except OSError as e:
             ui_conexion_bloqueada(False)
             messagebox.showerror(TITLE, f"No se pudo ejecutar scrcpy:\n{e}")
@@ -842,14 +1008,18 @@ def run_cli(args: argparse.Namespace) -> int:
         return r
 
     if args.no_scrcpy:
-        print("Listo (solo conexión). Ejecuta: scrcpy -S -s", serial)
+        print("Listo (solo conexión). Ejecuta: scrcpy -s", serial, "(añade -S para apagar pantalla del móvil)")
         return 0
 
     sc = resolve_scrcpy()
     if not sc:
         print("No se encontró scrcpy.", file=sys.stderr)
         return 1
-    cmd = [sc, "-S", "-s", serial, f"--window-title={TITLE}"]
+    cmd = [sc] + construir_argumentos_scrcpy(
+        serial,
+        getattr(args, "apagar_pantalla_movil", False),
+        getattr(args, "xiaomi_compat", False),
+    )
     print(f"→ {' '.join(cmd)}")
     return subprocess.call(cmd, env=scrcpy_subprocess_env())
 
@@ -887,6 +1057,16 @@ def main() -> int:
         "--no-scrcpy",
         action="store_true",
         help="Solo adb connect, no lanzar scrcpy",
+    )
+    parser.add_argument(
+        "--apagar-pantalla-movil",
+        action="store_true",
+        help="Pasar -S a scrcpy (apaga la pantalla física; con --xiaomi-compat se ignora)",
+    )
+    parser.add_argument(
+        "--xiaomi-compat",
+        action="store_true",
+        help="UHID + Metal + sin -S: Xiaomi/Redmi/MIUI (pantalla negra / sin toque)",
     )
     parser.add_argument(
         "--gui",
