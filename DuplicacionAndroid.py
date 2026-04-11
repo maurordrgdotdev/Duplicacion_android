@@ -123,6 +123,99 @@ def resolve_adb() -> Optional[str]:
     return shutil.which("adb")
 
 
+def resolve_android_sdk_root() -> Optional[Path]:
+    for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                return p.resolve()
+    home = Path.home()
+    for guess in (home / "Library/Android/sdk", home / "Android/Sdk"):
+        if guess.is_dir():
+            return guess.resolve()
+    return None
+
+
+def resolve_emulator_executable() -> Optional[str]:
+    sdk = resolve_android_sdk_root()
+    if sdk:
+        exe = sdk / "emulator" / "emulator"
+        if exe.is_file():
+            return str(exe.resolve())
+    _ensure_path_for_bundled_app()
+    return shutil.which("emulator")
+
+
+def listar_avds_del_sdk() -> tuple[List[str], Optional[str]]:
+    """Nombres de AVD según «emulator -list-avds»."""
+    emu = resolve_emulator_executable()
+    if not emu:
+        return [], None
+    r = subprocess.run(
+        [emu, "-list-avds"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        return [], err or "emulator -list-avds falló"
+    names = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    return names, None
+
+
+def avd_nombre_desde_serial_emulador(adb_bin: str, serial: str) -> Optional[str]:
+    if not serial.startswith("emulator-"):
+        return None
+    try:
+        r = subprocess.run(
+            [adb_bin, "-s", serial, "emu", "avd", "name"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    return lines[-1] if lines else None
+
+
+def seriales_emulador_en_adb(adb_bin: str) -> List[str]:
+    r = subprocess.run(
+        [adb_bin, "devices"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if r.returncode != 0:
+        return []
+    out: List[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        if state == "device" and serial.startswith("emulator-"):
+            out.append(serial)
+    return sorted(out)
+
+
+def esperar_serial_emulador_nuevo(
+    adb_bin: str, antes: set[str], timeout_s: float = 180.0
+) -> Optional[str]:
+    """Tras arrancar un AVD, devuelve un serial emulator-* nuevo en estado device."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        time.sleep(2.0)
+        ahora = set(seriales_emulador_en_adb(adb_bin))
+        candidatos = ahora - antes
+        for ser in sorted(candidatos):
+            if _adb_serial_en_estado_device(adb_bin, ser):
+                return ser
+    return None
+
+
 def _serial_parece_adb_por_red(serial: str) -> bool:
     """True si el serial tiene forma IPv4:puerto (dispositivo ya visto por ADB en red)."""
     if ":" not in serial:
@@ -195,12 +288,19 @@ def etiqueta_fila_dispositivo(
     nombre: Optional[str],
     kind: str,
 ) -> str:
-    """kind: usb | tcp | adb (solo afecta al sufijo [USB]/[Wi‑Fi])."""
+    """kind: usb | tcp | adb | emu | avd_off."""
     suf_nombre = f" — {nombre}" if nombre else ""
     if kind == "usb":
         return f"{serial}{suf_nombre}  [USB · cable]"
     if kind == "tcp":
         return f"{serial}{suf_nombre}  [Wi‑Fi · escaneo de red]"
+    if kind == "adb":
+        return f"{serial}{suf_nombre}  [Wi‑Fi · ya en adb, sin escaneo]"
+    if kind == "emu":
+        return f"{serial}{suf_nombre}  [Emulador · en ejecución]"
+    if kind == "avd_off":
+        avd = serial[4:] if serial.startswith("avd:") else serial
+        return f"{avd}{suf_nombre}  [Emulador · apagado — Conectar solo arranca el AVD]"
     return f"{serial}{suf_nombre}  [Wi‑Fi · ya en adb, sin escaneo]"
 
 
@@ -501,8 +601,9 @@ def run_gui(
 
     root = tk.Tk()
     root.title(TITLE)
-    root.geometry("560x440")
-    root.minsize(460, 360)
+    root.geometry("640x620")
+    root.minsize(560, 540)
+    root.configure(bg="#eceff4")
 
     icon_png = app_resources_dir() / "DuplicacionAndroidIcon.png"
     if icon_png.is_file():
@@ -513,69 +614,118 @@ def run_gui(
         except tk.TclError:
             pass
 
-    main = ttk.Frame(root, padding=8)
-    main.pack(fill=tk.BOTH, expand=True)
+    style = ttk.Style()
+    if sys.platform == "darwin":
+        try:
+            style.theme_use("aqua")
+        except tk.TclError:
+            pass
+    _f_base = "Helvetica Neue" if sys.platform == "darwin" else "Segoe UI"
+    style.configure("Dup.TFrame", background="#eceff4")
+    style.configure("DupCard.TLabelframe", background="#ffffff")
+    style.configure("DupCard.TLabelframe.Label", font=(_f_base, 13, "bold"), foreground="#1a1d24")
+    style.configure("Dup.TLabel", font=(_f_base, 12), foreground="#2e3440", background="#eceff4")
+    style.configure("DupMuted.TLabel", font=(_f_base, 11), foreground="#5e6778", background="#eceff4")
+    style.configure("DupHdr.TLabel", font=(_f_base, 20, "bold"), foreground="#1a1d24", background="#eceff4")
+    style.configure("Dup.TButton", font=(_f_base, 12), padding=(10, 6))
+    style.configure("DupAccent.TButton", font=(_f_base, 12, "bold"), padding=(12, 8))
+    style.map("DupAccent.TButton", foreground=[("disabled", "#888")])
+
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+    outer = ttk.Frame(root, padding=(20, 16, 20, 20), style="Dup.TFrame")
+    outer.grid(row=0, column=0, sticky="nsew")
+    outer.columnconfigure(0, weight=1)
+    outer.rowconfigure(2, weight=1)
+
+    ttk.Label(outer, text=TITLE, style="DupHdr.TLabel").grid(
+        row=0, column=0, sticky="w", pady=(0, 4)
+    )
+    ttk.Label(
+        outer,
+        text="Dispositivos físicos, red ADB y emuladores del SDK.",
+        style="DupMuted.TLabel",
+    ).grid(row=1, column=0, sticky="w", pady=(0, 12))
+
+    body = ttk.Frame(outer, style="Dup.TFrame")
+    body.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(1, weight=1)
+
+    lf_opts = ttk.LabelFrame(body, text="Red y opciones de espejo", padding=(12, 10), style="DupCard.TLabelframe")
+    lf_opts.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+    lf_opts.columnconfigure(1, weight=1)
+
+    lf_dev = ttk.LabelFrame(body, text="Dispositivos", padding=(10, 8), style="DupCard.TLabelframe")
+    lf_dev.grid(row=1, column=0, sticky="nsew")
+    lf_dev.columnconfigure(0, weight=1)
+    lf_dev.rowconfigure(1, weight=1)
 
     cidr_var = tk.StringVar(value=cidr or "")
     status = tk.StringVar(
-        value="Pulsa «Buscar dispositivos» para ver USB, red y dispositivos ya conectados por ADB."
+        value="Pulsa «Buscar dispositivos» para listar USB, Wi‑Fi, emuladores y AVD del SDK."
     )
-    ttk.Label(main, text="Red (opcional, vacío = /24 de tu IP):").pack(anchor=tk.W)
-    entry_cidr = ttk.Entry(main, textvariable=cidr_var)
-    entry_cidr.pack(fill=tk.X, pady=(0, 4))
-    ttk.Label(
-        main,
-        text=(
-            "Lista unificada: [USB] cable; [Wi‑Fi] red (escaneo o ya visto por adb). "
-            "Elige uno y «Conectar y duplicar». «Activar 5555 por USB» solo con cable."
-        ),
-        wraplength=520,
-        justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(0, 4))
+    ttk.Label(lf_opts, text="Red (opcional, vacío = /24 de tu IP):").grid(
+        row=0, column=0, sticky="nw", padx=(0, 8), pady=(0, 4)
+    )
+    entry_cidr = ttk.Entry(lf_opts, textvariable=cidr_var, width=36)
+    entry_cidr.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+
     apagar_pantalla_var = tk.BooleanVar(value=False)
+    compat_miu_var = tk.BooleanVar(value=True)
     ttk.Label(
-        main,
+        lf_opts,
         text=(
-            "Opción -S: apaga la pantalla física del móvil al duplicar. En Xiaomi/Redmi suele "
-            "impedir clics y gestos desde el Mac; déjala desmarcada si no controlas la pantalla."
+            "−S apaga la pantalla del móvil (en Xiaomi/Redmi suele romper control y vídeo). "
+            "MIUI: activa compatibilidad y «Depuración USB (ajustes de seguridad)» en el teléfono."
         ),
         wraplength=520,
         justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(0, 2))
+    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
     chk_apagar = ttk.Checkbutton(
-        main,
+        lf_opts,
         text="Apagar pantalla del teléfono al duplicar (-S)",
         variable=apagar_pantalla_var,
     )
-    chk_apagar.pack(anchor=tk.W, pady=(0, 2))
-    compat_miu_var = tk.BooleanVar(value=True)
-    ttk.Label(
-        main,
-        text=(
-            "Xiaomi / Redmi / MIUI: ratón y teclado por UHID, render Metal en Mac y se ignora -S "
-            "mientras esto esté activo (evita pantalla negra y sin toque). "
-            "En el móvil activa también «Depuración USB (ajustes de seguridad)». "
-            "Desmarca solo si otro dispositivo falla con UHID."
-        ),
-        wraplength=520,
-        justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(0, 2))
+    chk_apagar.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 4))
     chk_compat_miu = ttk.Checkbutton(
-        main,
-        text="Compatibilidad Xiaomi / MIUI (recomendado para Redmi)",
+        lf_opts,
+        text="Compatibilidad Xiaomi / MIUI (UHID + Metal; ignora -S)",
         variable=compat_miu_var,
     )
-    chk_compat_miu.pack(anchor=tk.W, pady=(0, 4))
-    ttk.Label(main, textvariable=status).pack(anchor=tk.W)
-    lb_frame = ttk.Frame(main)
-    lb_frame.pack(fill=tk.BOTH, expand=True, pady=6)
+    chk_compat_miu.grid(row=3, column=0, columnspan=2, sticky="w")
+
+    ttk.Label(lf_dev, textvariable=status, wraplength=520).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+    )
+    lb_frame = ttk.Frame(lf_dev)
+    lb_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+    lb_frame.columnconfigure(0, weight=1)
+    lb_frame.rowconfigure(0, weight=1)
     sb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL)
-    listbox = tk.Listbox(lb_frame, height=11, exportselection=False, yscrollcommand=sb.set)
+    listbox = tk.Listbox(
+        lb_frame,
+        height=8,
+        exportselection=False,
+        yscrollcommand=sb.set,
+        font=(_f_base, 12),
+        bg="#ffffff",
+        fg="#1a1d24",
+        selectbackground="#5e81ac",
+        selectforeground="#ffffff",
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#d8dee9",
+        highlightcolor="#5e81ac",
+        activestyle="none",
+    )
     sb.config(command=listbox.yview)
-    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    sb.pack(side=tk.RIGHT, fill=tk.Y)
-    btn_row = ttk.Frame(main)
-    btn_row.pack(fill=tk.X)
+    listbox.grid(row=0, column=0, sticky="nsew")
+    sb.grid(row=0, column=1, sticky="ns")
+
+    btn_row = ttk.Frame(outer, style="Dup.TFrame")
+    btn_row.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+    btn_row.columnconfigure(0, weight=1)
 
     # texto, serial adb, requiere adb connect, kind: usb|tcp|adb
     filas_actuales: List[Tuple[str, str, bool, str]] = []
@@ -610,20 +760,27 @@ def run_gui(
             ips, err_red = _resolver_ips(raw or None, prefijo)
             usbs, reds_en_adb, err_adb = clasificar_dispositivos_adb(adb_bin)
             if err_red:
-                root.after(0, lambda: on_scan_merge([], [], set(), err_red, None))
+                root.after(
+                    0,
+                    lambda: on_scan_merge([], [], set(), err_red, None, []),
+                )
                 return
             assert ips is not None
             encontrados_tcp = escanear_puerto_5555(ips, workers, timeout_s)
             tcp_serials = {f"{ip}:5555" for ip in encontrados_tcp}
             wifi_serials = set(tcp_serials) | set(reds_en_adb)
+            avd_nombres, _ = listar_avds_del_sdk()
+            u_sorted = sorted(usbs)
+            w_sorted = sorted(wifi_serials, key=_orden_serial_red)
             root.after(
                 0,
                 lambda: on_scan_merge(
-                    sorted(usbs),
-                    sorted(wifi_serials, key=_orden_serial_red),
+                    u_sorted,
+                    w_sorted,
                     tcp_serials,
                     None,
                     err_adb,
+                    avd_nombres,
                 ),
             )
 
@@ -635,6 +792,7 @@ def run_gui(
         tcp_serials: set[str],
         err_red: Optional[str],
         err_adb: Optional[str],
+        avd_nombres: List[str],
     ) -> None:
         nonlocal filas_actuales
         filas_actuales = []
@@ -643,35 +801,62 @@ def run_gui(
             set_status(err_red)
             messagebox.showerror(TITLE, err_red)
             return
-        for s in usbs:
+        physical = [s for s in usbs if not s.startswith("emulator-")]
+        emus = [s for s in usbs if s.startswith("emulator-")]
+        adb_b = resolve_adb()
+        running_avd: set[str] = set()
+        if adb_b:
+            for ser in emus:
+                an = avd_nombre_desde_serial_emulador(adb_b, ser)
+                if an:
+                    running_avd.add(an)
+        for s in physical:
             filas_actuales.append(
                 (etiqueta_fila_dispositivo(s, None, "usb"), s, False, "usb")
+            )
+        for s in sorted(emus):
+            filas_actuales.append(
+                (etiqueta_fila_dispositivo(s, None, "emu"), s, False, "emu")
             )
         for ser in wifi_ordenados:
             wkind = "tcp" if ser in tcp_serials else "adb"
             filas_actuales.append(
                 (etiqueta_fila_dispositivo(ser, None, wkind), ser, True, wkind)
             )
+        for name in sorted(avd_nombres):
+            if name in running_avd:
+                continue
+            token = f"avd:{name}"
+            filas_actuales.append(
+                (etiqueta_fila_dispositivo(token, None, "avd_off"), token, False, "avd_off")
+            )
         for label, _, _, _ in filas_actuales:
             listbox.insert(tk.END, label)
         if filas_actuales:
             listbox.selection_set(0)
-        n_usb = len(usbs)
+        n_phy = len(physical)
+        n_emu = len(emus)
         n_wifi = len(wifi_ordenados)
+        n_avd_off = len([n for n in avd_nombres if n not in running_avd])
         set_status(
-            f"{n_usb} por USB, {n_wifi} por Wi‑Fi en lista. "
-            "Obteniendo nombres (fabricante/modelo)…"
+            f"{n_phy} USB, {n_wifi} Wi‑Fi, {n_emu} emulador(es) en marcha, {n_avd_off} AVD apagado(s). "
+            "Obteniendo nombres…"
         )
 
         def enrich_worker() -> None:
-            adb_b = resolve_adb()
-            if not adb_b or not filas_actuales:
+            adb_bin = resolve_adb()
+            if not adb_bin or not filas_actuales:
                 return
             snapshot = list(filas_actuales)
             updates: List[Tuple[int, str, bool, str, Optional[str]]] = []
             for i, (_, ser, req, kind) in enumerate(snapshot):
+                if kind == "avd_off":
+                    updates.append((i, ser, req, kind, None))
+                    continue
                 nom = obtener_nombre_dispositivo_adb(
-                    adb_b, ser, intentar_connect=(kind != "usb")
+                    adb_bin,
+                    ser,
+                    intentar_connect=(kind not in ("usb", "emu")),
                 )
                 updates.append((i, ser, req, kind, nom))
 
@@ -686,8 +871,8 @@ def run_gui(
                     listbox.delete(i)
                     listbox.insert(i, lab)
                 set_status(
-                    f"{n_usb} por USB, {n_wifi} por Wi‑Fi en lista. "
-                    "Si el móvil no sale: misma Wi‑Fi, sin aislamiento AP, o prueba «Activar 5555 por USB»."
+                    f"{n_phy} USB, {n_wifi} Wi‑Fi, {n_emu} emulador(es), {n_avd_off} AVD listo(s) para arrancar. "
+                    "Emulador apagado: «Conectar y duplicar» solo arranca el AVD (sin scrcpy)."
                 )
 
             root.after(0, apply_ui)
@@ -705,7 +890,8 @@ def run_gui(
                 "No hay dispositivos.\n"
                 "· USB: cable, depuración USB y autorizar este equipo.\n"
                 "· Wi‑Fi: en el móvil depuración inalámbrica o «adb tcpip 5555» con cable; "
-                "PC y teléfono en la misma red.",
+                "PC y teléfono en la misma red.\n"
+                "· Emuladores: ANDROID_HOME y carpeta emulator/; crea AVD desde Android Studio.",
             )
 
     def aplicar_tcpip_usb() -> None:
@@ -722,7 +908,13 @@ def run_gui(
         idx = sel[0]
         if idx >= len(filas_actuales):
             return
-        _, serial, requiere_connect, _ = filas_actuales[idx]
+        _, serial, requiere_connect, kind = filas_actuales[idx]
+        if kind in ("emu", "avd_off"):
+            messagebox.showinfo(
+                TITLE,
+                "«Activar 5555 por USB» no aplica a emuladores. Usa una línea [USB · cable].",
+            )
+            return
         if requiere_connect:
             messagebox.showwarning(
                 TITLE,
@@ -772,43 +964,7 @@ def run_gui(
         except tk.TclError:
             return False
 
-    def do_connect() -> None:
-        sel = listbox.curselection()
-        if not sel:
-            messagebox.showwarning(TITLE, "Selecciona un dispositivo de la lista.")
-            return
-        activo = proceso_espejo[0]
-        if activo is not None and activo.poll() is None:
-            messagebox.showinfo(
-                TITLE,
-                "Ya hay un espejo en curso. Cierra esa ventana primero o espera a que termine.",
-            )
-            return
-        idx = sel[0]
-        if idx >= len(filas_actuales):
-            messagebox.showwarning(TITLE, "Vuelve a pulsar «Buscar dispositivos».")
-            return
-        _, serial, requiere_adb_connect, _ = filas_actuales[idx]
-        ui_conexion_bloqueada(True)
-        adb_bin = resolve_adb()
-        assert adb_bin
-        if requiere_adb_connect:
-            set_status("Conectando por Wi‑Fi (adb connect)…")
-            root.update_idletasks()
-            r = subprocess.run(
-                [adb_bin, "connect", serial],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if r.returncode != 0:
-                ui_conexion_bloqueada(False)
-                messagebox.showerror(TITLE, f"adb connect falló:\n{r.stderr or r.stdout}")
-                set_status("Error en adb connect.")
-                return
-        else:
-            set_status("Conectando por USB (sin adb connect)…")
-            root.update_idletasks()
+    def _iniciar_espejo_tras_conexion(serial_espejo: str) -> None:
         if apagar_pantalla_var.get() and compat_miu_var.get():
             set_status(
                 "Compat. MIUI activa: no se usará -S (evita negro/sin toque en Xiaomi). Iniciando espejo…"
@@ -818,7 +974,7 @@ def run_gui(
         root.update_idletasks()
         try:
             proc, err_log_path = popen_scrcpy(
-                serial,
+                serial_espejo,
                 apagar_pantalla_fisica=apagar_pantalla_var.get(),
                 compat_miu=compat_miu_var.get(),
             )
@@ -914,16 +1070,153 @@ def run_gui(
 
         threading.Thread(target=esperar_arranque_scrcpy, daemon=True).start()
 
-    btn_scan = ttk.Button(btn_row, text="Buscar dispositivos", command=do_scan)
-    btn_scan.pack(side=tk.LEFT, padx=(0, 6))
-    btn_connect = ttk.Button(btn_row, text="Conectar y duplicar", command=do_connect)
-    btn_connect.pack(side=tk.LEFT, padx=(0, 6))
+    def do_connect() -> None:
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showwarning(TITLE, "Selecciona un dispositivo de la lista.")
+            return
+        activo = proceso_espejo[0]
+        if activo is not None and activo.poll() is None:
+            messagebox.showinfo(
+                TITLE,
+                "Ya hay un espejo en curso. Cierra esa ventana primero o espera a que termine.",
+            )
+            return
+        idx = sel[0]
+        if idx >= len(filas_actuales):
+            messagebox.showwarning(TITLE, "Vuelve a pulsar «Buscar dispositivos».")
+            return
+        _, serial, requiere_adb_connect, kind = filas_actuales[idx]
+
+        if kind == "emu":
+            messagebox.showinfo(
+                TITLE,
+                "Este emulador ya está en ejecución y tiene su ventana del Android Emulator.\n\n"
+                "No se abrirá un duplicado con scrcpy.\n\n"
+                "Para ver la pantalla duplicada aquí, elige un teléfono físico o por Wi‑Fi.",
+            )
+            set_status(
+                f"Emulador {serial}: usa la ventana del Android Emulator (sin duplicación)."
+            )
+            return
+
+        if kind == "avd_off":
+            if not serial.startswith("avd:"):
+                messagebox.showerror(TITLE, "Entrada de emulador inválida.")
+                return
+            avd = serial[4:]
+            emu_bin = resolve_emulator_executable()
+            if not emu_bin:
+                messagebox.showerror(
+                    TITLE,
+                    "No se encontró «emulator».\n"
+                    "Instala Android SDK, define ANDROID_HOME y comprueba que exista "
+                    "$ANDROID_HOME/emulator/emulator.",
+                )
+                return
+            ui_conexion_bloqueada(True)
+            set_status(f"Iniciando emulador «{avd}» (puede tardar más de un minuto)…")
+            root.update_idletasks()
+            adb_bin = resolve_adb()
+            assert adb_bin
+
+            def boot_avd_work() -> None:
+                antes = set(seriales_emulador_en_adb(adb_bin))
+                try:
+                    subprocess.Popen(
+                        [emu_bin, "-avd", avd],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except OSError as e:
+
+                    def err_ui() -> None:
+                        ui_conexion_bloqueada(False)
+                        messagebox.showerror(TITLE, f"No se pudo lanzar el emulador:\n{e}")
+                        set_status("Error al iniciar el emulador.")
+
+                    root.after(0, err_ui)
+                    return
+                ser_nuevo = esperar_serial_emulador_nuevo(adb_bin, antes, 200.0)
+
+                def done_ui() -> None:
+                    if not _root_viva():
+                        ui_conexion_bloqueada(False)
+                        return
+                    if not ser_nuevo:
+                        ui_conexion_bloqueada(False)
+                        messagebox.showerror(
+                            TITLE,
+                            "El emulador no apareció en «adb devices» a tiempo.\n"
+                            "Comprueba el SDK, espacio en disco y que el AVD arranque manualmente.",
+                        )
+                        set_status("Timeout esperando al emulador.")
+                        return
+                    ui_conexion_bloqueada(False)
+                    set_status(
+                        f"Emulador listo ({ser_nuevo}). Usa su ventana «Android Emulator»; "
+                        "no se abre duplicación con scrcpy."
+                    )
+                    messagebox.showinfo(
+                        TITLE,
+                        f"El AVD «{avd}» está arrancando o listo ({ser_nuevo}).\n\n"
+                        "Usa la ventana del Android Emulator para interactuar.\n"
+                        "Esta app no duplica emuladores con scrcpy para evitar dos pantallas iguales.\n\n"
+                        "Pulsa «Buscar dispositivos» para refrescar la lista.",
+                    )
+
+                root.after(0, done_ui)
+
+            threading.Thread(target=boot_avd_work, daemon=True).start()
+            return
+
+        ui_conexion_bloqueada(True)
+        adb_bin = resolve_adb()
+        assert adb_bin
+        if requiere_adb_connect:
+            set_status("Conectando por Wi‑Fi (adb connect)…")
+            root.update_idletasks()
+            r = subprocess.run(
+                [adb_bin, "connect", serial],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                ui_conexion_bloqueada(False)
+                messagebox.showerror(TITLE, f"adb connect falló:\n{r.stderr or r.stdout}")
+                set_status("Error en adb connect.")
+                return
+        else:
+            if kind == "emu":
+                set_status("Conectando al emulador en ejecución…")
+            else:
+                set_status("Conectando por USB (sin adb connect)…")
+            root.update_idletasks()
+        _iniciar_espejo_tras_conexion(serial)
+
+    btn_inner = ttk.Frame(btn_row, style="Dup.TFrame")
+    btn_inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    btn_scan = ttk.Button(
+        btn_inner, text="Buscar dispositivos", command=do_scan, style="Dup.TButton"
+    )
+    btn_scan.pack(side=tk.LEFT, padx=(0, 8), pady=4)
+    btn_connect = ttk.Button(
+        btn_inner,
+        text="Conectar y duplicar",
+        command=do_connect,
+        style="DupAccent.TButton",
+    )
+    btn_connect.pack(side=tk.LEFT, padx=(0, 8), pady=4)
     btn_tcpip_usb = ttk.Button(
-        btn_row,
+        btn_inner,
         text="Activar 5555 por USB",
         command=aplicar_tcpip_usb,
+        style="Dup.TButton",
     )
-    btn_tcpip_usb.pack(side=tk.LEFT, padx=(0, 6))
+    btn_tcpip_usb.pack(side=tk.LEFT, padx=(0, 8), pady=4)
 
     def on_salir() -> None:
         p = proceso_espejo[0]
@@ -949,7 +1242,9 @@ def run_gui(
             proceso_espejo[0] = None
         root.destroy()
 
-    ttk.Button(btn_row, text="Salir", command=on_salir).pack(side=tk.RIGHT)
+    ttk.Button(btn_row, text="Salir", command=on_salir, style="Dup.TButton").pack(
+        side=tk.RIGHT, padx=(12, 0), pady=4
+    )
     root.protocol("WM_DELETE_WINDOW", on_salir)
 
     root.mainloop()
